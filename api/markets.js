@@ -1,5 +1,15 @@
+// api/markets.js
+import { createClient } from '@vercel/kv';
+
 const KEY = process.env.TWELVEDATA_API_KEY;
 if (!KEY) throw new Error("Missing TWELVEDATA_API_KEY");
+
+const kv = createClient({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN
+});
+
+const CACHE_KEY = 'last_valid_markets_data';
 
 async function j(url) {
   const r = await fetch(url);
@@ -19,22 +29,86 @@ async function quote(sym) {
   if (d?.status === "error" || (d?.code && d?.message)) throw new Error(`TwelveData ${sym}: ${d.message}`);
   const p = num(d.close ?? d.price);
   if (p == null) throw new Error(`Bad price for ${sym}: ${JSON.stringify(d).slice(0,200)}`);
-  return { price: p, change: num(d.change), percent_change: num(d.percent_change) };
+  return {
+    price: p,
+    change: num(d.change),
+    percent_change: num(d.percent_change)
+  };
 }
 
 export default async function handler(req, res) {
   try {
-    const [spy, iau] = await Promise.all([quote("SPY"), quote("IAU")]);
-    const now = new Date().toISOString();
-    const marketsObj = { updated_iso: now, symbols: { SPY: spy, IAU: iau } };
+    const now = new Date();
+    const chicagoNow = now.toLocaleString("en-US", { timeZone: "America/Chicago" });
+    const dt = new Date(chicagoNow);
+
+    const dayOfWeek = dt.getDay();           // 0=Sun, 1=Mon, ..., 6=Sat
+    const hour = dt.getHours();               // 0-23
+    const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+    const isMarketHours = isWeekday && hour >= 9 && hour < 17;
+
+    let marketsObj;
+
+    if (isMarketHours) {
+      // ── Fetch fresh during market hours ───────────────────────────────
+      console.log(`Market open (${dt.toLocaleTimeString()}) → fetching SPY/IAU`);
+
+      const [spy, iau] = await Promise.all([quote("SPY"), quote("IAU")]);
+
+      marketsObj = {
+        updated_iso: now.toISOString(),
+        updated_local: dt.toLocaleString("en-US", {
+          timeZone: "America/Chicago",
+          dateStyle: "short",
+          timeStyle: "short",
+          hour12: false
+        }),
+        in_hours: true,
+        symbols: {
+          SPY: spy,
+          IAU: iau
+        }
+      };
+
+      // Store in KV (fire-and-forget – don't block response)
+      kv.set(CACHE_KEY, marketsObj)
+        .catch(err => console.error("KV cache save failed:", err));
+    } else {
+      // ── Outside hours → return last known good data ───────────────────
+      console.log(`Outside market hours → serving cached data`);
+
+      const cached = await kv.get(CACHE_KEY);
+
+      if (cached) {
+        marketsObj = {
+          ...cached,
+          in_hours: false,
+          current_fetch_iso: now.toISOString(),
+          current_fetch_local: dt.toLocaleString("en-US", {
+            timeZone: "America/Chicago",
+            dateStyle: "short",
+            timeStyle: "short"
+          })
+        };
+      } else {
+        // No cache yet (first run or cache expired/cleared)
+        marketsObj = {
+          updated_iso: null,
+          in_hours: false,
+          error: "No previous market data cached",
+          symbols: { SPY: null, IAU: null }
+        };
+      }
+    }
 
     const banner = `// AUTO-GENERATED. DO NOT EDIT.\n`;
-    const js = banner + `window.DASH_DATA = window.DASH_DATA || {}; window.DASH_DATA.markets = ${JSON.stringify(marketsObj)};`;
+    const js = banner + `window.DASH_DATA = window.DASH_DATA || {}; window.DASH_DATA.markets = ${JSON.stringify(marketsObj)};\n`;
 
     res.setHeader('Content-Type', 'application/javascript');
-    res.setHeader('Cache-Control', 's-maxage=900'); // Cache for 15 min at edge (adjust as needed)
+    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=60'); // 5 min + some stale tolerance
     res.send(js);
   } catch (err) {
-    res.status(500).send(`// Error: ${err.message}`);
+    console.error("Markets handler error:", err);
+    res.status(500).send(`// Error: ${err.message || 'Unknown error'}`);
   }
 }
