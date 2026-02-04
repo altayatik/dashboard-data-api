@@ -1,6 +1,12 @@
 {
-  "name": "dashboard-api",
+  "name": "dashboard-data-api",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
-  "private": true
+  "dependencies": {
+    "@vercel/kv": "^1.0.1"
+  },
+  "scripts": {
+    "dev": "vercel dev"
+  }
 }
