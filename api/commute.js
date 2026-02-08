@@ -1,9 +1,9 @@
 // api/commute.js
 // JSON endpoint: /api/commute?from=...&to=...
-// Uses TomTom Geocoding (Search API) + TomTom Routing (traffic=true)
+// Uses TomTom Search (fuzzy) + TomTom Routing (traffic=true)
 // Caches per (from,to) pair in Vercel KV.
 //
-// IMPORTANT: Bias geocoding to Chicago to avoid wrong matches (e.g. Bethalto, IL).
+// Fixes ambiguous inputs by appending ", Chicago, IL" when the query lacks locality.
 
 import { createClient } from "@vercel/kv";
 import crypto from "crypto";
@@ -16,19 +16,8 @@ const kv = createClient({
 const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_KEY;
 const TTL_SEC = 300; // 5 minutes
 
-// Default geocode bias (Chicago)
-const CHI_BIAS = {
-  lat: 41.881832,
-  lon: -87.623177
-};
-
-// Rough Chicagoland bounding box (top-left, bottom-right)
-// topLeft: (lat,lon) is NW corner
-// btmRight: (lat,lon) is SE corner
-const CHI_BBOX = {
-  topLeft: { lat: 42.50, lon: -88.60 },
-  btmRight: { lat: 41.30, lon: -87.10 }
-};
+// Bias center (downtown Chicago)
+const CHI_BIAS = { lat: 41.881832, lon: -87.623177 };
 
 function badRequest(res, msg) {
   res.status(400).json({ error: msg });
@@ -46,92 +35,68 @@ function clampLen(s, max) {
 function cacheKey(from, to) {
   const raw = `${from}||${to}`.toLowerCase();
   const hash = crypto.createHash("sha1").update(raw).digest("hex");
-  return `dash_commute_v2_${hash}`;
+  return `dash_commute_v3_${hash}`;
 }
 
-function num(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+// Heuristic: If the user didn't include an obvious locality, assume Chicago.
+// This fixes "Wrigley Field" -> Wrigley Field, Chicago, IL (instead of Bethalto).
+function normalizeQueryToChicago(q) {
+  const s = String(q || "").trim();
+  if (!s) return s;
+
+  const lower = s.toLowerCase();
+
+  // If already includes Chicago / IL / ZIP / state-ish comma patterns, leave it alone
+  const hasChicago = lower.includes("chicago");
+  const hasIL = /\bil\b/.test(lower) || lower.includes("illinois");
+  const hasZip = /\b\d{5}(-\d{4})?\b/.test(lower);
+  const hasComma = s.includes(","); // crude but works well for "city, state"
+  const hasStateAbbrev = /\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/i.test(s);
+
+  if (hasChicago || hasIL || hasZip || (hasComma && hasStateAbbrev)) return s;
+
+  return `${s}, Chicago, IL`;
 }
 
-function parseOptionalBias(req) {
-  // Optional: allow ?bias_lat=...&bias_lon=... or ?bbox=topLat,topLon,btmLat,btmLon
-  const biasLat = num(req.query.bias_lat);
-  const biasLon = num(req.query.bias_lon);
-
-  let bias = { ...CHI_BIAS };
-  if (biasLat != null && biasLon != null) {
-    bias = { lat: biasLat, lon: biasLon };
-  }
-
-  let bbox = { ...CHI_BBOX };
-  const bboxRaw = String(req.query.bbox ?? "").trim();
-  if (bboxRaw) {
-    const parts = bboxRaw.split(",").map(x => Number(x));
-    if (parts.length === 4 && parts.every(Number.isFinite)) {
-      bbox = {
-        topLeft: { lat: parts[0], lon: parts[1] },
-        btmRight: { lat: parts[2], lon: parts[3] }
-      };
-    }
-  }
-
-  return { bias, bbox };
-}
-
-async function geocodeOne(query, bias, bbox) {
-  // TomTom Geocoding API:
-  // https://api.tomtom.com/search/2/geocode/{query}.json
+async function searchOne(query) {
+  // TomTom Fuzzy Search:
+  // https://api.tomtom.com/search/2/search/{query}.json
   //
-  // We bias towards Chicago:
-  // - lat/lon: location bias
-  // - topLeft/btmRight: bounding box
-  //
-  // NOTE: Parameter names differ across TomTom endpoints; on geocode this is supported.
+  // We bias around Chicago using lat/lon. This endpoint generally respects it.
   const qs = new URLSearchParams({
     key: TOMTOM_KEY,
     limit: "5",
     countrySet: "US",
-    lat: String(bias.lat),
-    lon: String(bias.lon),
-    topLeft: `${bbox.topLeft.lat},${bbox.topLeft.lon}`,
-    btmRight: `${bbox.btmRight.lat},${bbox.btmRight.lon}`
+    language: "en-US",
+    lat: String(CHI_BIAS.lat),
+    lon: String(CHI_BIAS.lon)
   });
 
-  const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(query)}.json?${qs.toString()}`;
+  const url = `https://api.tomtom.com/search/2/search/${encodeURIComponent(query)}.json?${qs.toString()}`;
+
   const resp = await fetch(url);
   const data = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
-    throw new Error(`TomTom geocode HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`);
+    throw new Error(`TomTom search HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`);
   }
 
   const results = Array.isArray(data?.results) ? data.results : [];
-  if (!results.length) throw new Error(`Geocode failed for "${query}"`);
+  if (!results.length) throw new Error(`Search failed for "${query}"`);
 
-  // Choose best result near the bias point (TomTom often sorts well already, but we'll be safe)
-  // Use "score" if available; otherwise fallback to first.
-  // Many TomTom responses include "score" (higher = better).
-  let best = results[0];
-  let bestScore = Number(best?.score ?? -Infinity);
+  // TomTom sorts by relevance; choose first.
+  const r = results[0];
 
-  for (const r of results) {
-    const s = Number(r?.score ?? -Infinity);
-    if (s > bestScore) {
-      best = r;
-      bestScore = s;
-    }
-  }
-
-  const lat = Number(best?.position?.lat);
-  const lon = Number(best?.position?.lon);
+  const lat = Number(r?.position?.lat);
+  const lon = Number(r?.position?.lon);
   const label =
-    best?.address?.freeformAddress ||
-    best?.address?.municipality ||
+    r?.address?.freeformAddress ||
+    r?.poi?.name ||
+    r?.address?.municipality ||
     query;
 
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    throw new Error(`Geocode failed for "${query}"`);
+    throw new Error(`Search failed for "${query}" (missing lat/lon)`);
   }
 
   return { label, lat, lon };
@@ -185,7 +150,6 @@ export default async function handler(req, res) {
 
     const fromRaw = clampLen(req.query.from, 160);
     const toRaw = clampLen(req.query.to, 160);
-
     if (!fromRaw || !toRaw) {
       return badRequest(res, 'Provide query params: ?from="..."&to="..."');
     }
@@ -201,11 +165,12 @@ export default async function handler(req, res) {
       return res.status(200).json(cached);
     }
 
-    const { bias, bbox } = parseOptionalBias(req);
+    const fromQ = normalizeQueryToChicago(fromRaw);
+    const toQ = normalizeQueryToChicago(toRaw);
 
     const [fromPos, toPos] = await Promise.all([
-      geocodeOne(fromRaw, bias, bbox),
-      geocodeOne(toRaw, bias, bbox)
+      searchOne(fromQ),
+      searchOne(toQ)
     ]);
 
     const route = await tomtomRoute(fromPos, toPos);
@@ -218,7 +183,6 @@ export default async function handler(req, res) {
     };
 
     kv.set(key, out).catch(() => {});
-
     res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=600");
     return res.status(200).json(out);
 
