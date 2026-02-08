@@ -9,11 +9,11 @@ const kv = createClient({
   token: process.env.KV_REST_API_TOKEN
 });
 
-// Support either env var name (in case you used TOMTOM_API_KEY in Vercel UI)
-const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_API_KEY;
+// Support either env var name (in case you used TOMTOM_KEY in Vercel UI)
+const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_KEY;
 
 const CACHE_KEY = "dash_traffic_snapshot_v1";
-const SNAP_TTL_SEC = 300; // 5 minutes (good for e-ink + keeps free quota low)
+const SNAP_TTL_SEC = 300; // 5 minutes
 
 function statusFromRatio(ratio) {
   if (ratio == null || !Number.isFinite(ratio)) return "Light";
@@ -38,8 +38,6 @@ function getRoutes() {
     return parsed;
   }
 
-  // Default fallback coordinates (edit or set TRAFFIC_ROUTES_JSON)
-  // These are just placeholders – you should override in env for your preferred corridors.
   return [
     { id: "I90_94", label: "I-90/94", origin: [41.971, -87.761], destination: [41.883, -87.632] },
     { id: "I290",   label: "I-290",   origin: [41.886, -87.798], destination: [41.883, -87.632] },
@@ -48,13 +46,12 @@ function getRoutes() {
 }
 
 async function tomtomRoute(origin, destination) {
-  // TomTom expects: "lat,lon:lat,lon"
   const loc = `${origin[0]},${origin[1]}:${destination[0]},${destination[1]}`;
 
   const qs = new URLSearchParams({
     key: TOMTOM_KEY,
     traffic: "true",
-    computeTravelTimeFor: "all", // ensures baseline no-traffic time is included
+    computeTravelTimeFor: "all",
     routeRepresentation: "summaryOnly",
     routeType: "fastest"
   });
@@ -93,13 +90,12 @@ function sendEmbedded(res, obj) {
 export default async function handler(req, res) {
   try {
     if (!TOMTOM_KEY) {
-      return res.status(500).send("// Error: Missing TOMTOM_API_KEY env var");
+      return res.status(500).send("// Error: Missing TOMTOM_API_KEY (or TOMTOM_KEY) env var");
     }
     if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
       return res.status(500).send("// Error: Missing KV_REST_API_URL / KV_REST_API_TOKEN env vars");
     }
 
-    // 1) Try KV cache first
     const cached = await kv.get(CACHE_KEY);
     const cachedAt = cached?.updated_iso ? Date.parse(cached.updated_iso) : 0;
     const cacheFresh = cachedAt && ((Date.now() - cachedAt) / 1000) < SNAP_TTL_SEC;
@@ -108,7 +104,6 @@ export default async function handler(req, res) {
       return sendEmbedded(res, cached);
     }
 
-    // 2) Compute fresh snapshot
     const routes = getRoutes();
 
     const results = await Promise.all(
@@ -128,9 +123,7 @@ export default async function handler(req, res) {
       routes: results
     };
 
-    // 3) Save to KV (best-effort)
     kv.set(CACHE_KEY, out).catch(() => {});
-
     return sendEmbedded(res, out);
 
   } catch (err) {
