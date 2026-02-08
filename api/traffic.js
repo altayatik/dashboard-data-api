@@ -1,6 +1,7 @@
 // api/traffic.js
 // Embedded JS endpoint: sets window.DASH_DATA.traffic
 // Uses TomTom Routing API (traffic-aware travel time) + Vercel KV cache.
+// Adds CORS headers (harmless for <script> usage, helpful if you ever fetch it).
 
 import { createClient } from "@vercel/kv";
 
@@ -9,11 +10,17 @@ const kv = createClient({
   token: process.env.KV_REST_API_TOKEN
 });
 
-// Support either env var name (in case you used TOMTOM_KEY in Vercel UI)
 const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_KEY;
 
 const CACHE_KEY = "dash_traffic_snapshot_v1";
-const SNAP_TTL_SEC = 300; // 5 minutes
+const SNAP_TTL_SEC = 300;
+
+function setCors(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+  res.setHeader("Vary", "Origin");
+}
 
 function statusFromRatio(ratio) {
   if (ratio == null || !Number.isFinite(ratio)) return "Light";
@@ -23,10 +30,6 @@ function statusFromRatio(ratio) {
   return "Severe";
 }
 
-/**
- * Routes are "corridor proxies" (origin -> destination).
- * You can override via TRAFFIC_ROUTES_JSON env var (recommended).
- */
 function getRoutes() {
   const raw = process.env.TRAFFIC_ROUTES_JSON;
 
@@ -82,12 +85,16 @@ async function tomtomRoute(origin, destination) {
 function sendEmbedded(res, obj) {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
   res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=600");
-  res.send(
-    `window.DASH_DATA=window.DASH_DATA||{};window.DASH_DATA.traffic=${JSON.stringify(obj)};`
-  );
+  res.send(`window.DASH_DATA=window.DASH_DATA||{};window.DASH_DATA.traffic=${JSON.stringify(obj)};`);
 }
 
 export default async function handler(req, res) {
+  setCors(req, res);
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   try {
     if (!TOMTOM_KEY) {
       return res.status(500).send("// Error: Missing TOMTOM_API_KEY (or TOMTOM_KEY) env var");
@@ -118,11 +125,7 @@ export default async function handler(req, res) {
       })
     );
 
-    const out = {
-      updated_iso: new Date().toISOString(),
-      routes: results
-    };
-
+    const out = { updated_iso: new Date().toISOString(), routes: results };
     kv.set(CACHE_KEY, out).catch(() => {});
     return sendEmbedded(res, out);
 

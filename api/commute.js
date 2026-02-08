@@ -2,8 +2,7 @@
 // JSON endpoint: /api/commute?from=...&to=...
 // Uses TomTom Search (fuzzy) + TomTom Routing (traffic=true)
 // Caches per (from,to) pair in Vercel KV.
-//
-// Fixes ambiguous inputs by appending ", Chicago, IL" when the query lacks locality.
+// Includes CORS headers so local dev (127.0.0.1) can fetch.
 
 import { createClient } from "@vercel/kv";
 import crypto from "crypto";
@@ -18,6 +17,15 @@ const TTL_SEC = 300; // 5 minutes
 
 // Bias center (downtown Chicago)
 const CHI_BIAS = { lat: 41.881832, lon: -87.623177 };
+
+function setCors(req, res) {
+  // For personal dashboards, "*" is fine. If you want to lock down later,
+  // set a specific origin instead.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+  res.setHeader("Vary", "Origin");
+}
 
 function badRequest(res, msg) {
   res.status(400).json({ error: msg });
@@ -39,30 +47,26 @@ function cacheKey(from, to) {
 }
 
 // Heuristic: If the user didn't include an obvious locality, assume Chicago.
-// This fixes "Wrigley Field" -> Wrigley Field, Chicago, IL (instead of Bethalto).
 function normalizeQueryToChicago(q) {
   const s = String(q || "").trim();
   if (!s) return s;
 
   const lower = s.toLowerCase();
 
-  // If already includes Chicago / IL / ZIP / state-ish comma patterns, leave it alone
   const hasChicago = lower.includes("chicago");
   const hasIL = /\bil\b/.test(lower) || lower.includes("illinois");
   const hasZip = /\b\d{5}(-\d{4})?\b/.test(lower);
-  const hasComma = s.includes(","); // crude but works well for "city, state"
-  const hasStateAbbrev = /\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/i.test(s);
+  const hasComma = s.includes(",");
+  const hasStateAbbrev =
+    /\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/i.test(
+      s
+    );
 
   if (hasChicago || hasIL || hasZip || (hasComma && hasStateAbbrev)) return s;
-
   return `${s}, Chicago, IL`;
 }
 
 async function searchOne(query) {
-  // TomTom Fuzzy Search:
-  // https://api.tomtom.com/search/2/search/{query}.json
-  //
-  // We bias around Chicago using lat/lon. This endpoint generally respects it.
   const qs = new URLSearchParams({
     key: TOMTOM_KEY,
     limit: "5",
@@ -72,19 +76,22 @@ async function searchOne(query) {
     lon: String(CHI_BIAS.lon)
   });
 
-  const url = `https://api.tomtom.com/search/2/search/${encodeURIComponent(query)}.json?${qs.toString()}`;
+  const url = `https://api.tomtom.com/search/2/search/${encodeURIComponent(
+    query
+  )}.json?${qs.toString()}`;
 
   const resp = await fetch(url);
   const data = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
-    throw new Error(`TomTom search HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`);
+    throw new Error(
+      `TomTom search HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`
+    );
   }
 
   const results = Array.isArray(data?.results) ? data.results : [];
   if (!results.length) throw new Error(`Search failed for "${query}"`);
 
-  // TomTom sorts by relevance; choose first.
   const r = results[0];
 
   const lat = Number(r?.position?.lat);
@@ -113,12 +120,17 @@ async function tomtomRoute(fromPos, toPos) {
     routeType: "fastest"
   });
 
-  const url = `https://api.tomtom.com/routing/1/calculateRoute/${encodeURIComponent(loc)}/json?${qs.toString()}`;
+  const url = `https://api.tomtom.com/routing/1/calculateRoute/${encodeURIComponent(
+    loc
+  )}/json?${qs.toString()}`;
+
   const resp = await fetch(url);
   const data = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
-    throw new Error(`TomTom routing HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`);
+    throw new Error(
+      `TomTom routing HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`
+    );
   }
 
   const s = data?.routes?.[0]?.summary;
@@ -128,7 +140,9 @@ async function tomtomRoute(fromPos, toPos) {
   const distanceM = Number(s?.lengthInMeters);
 
   if (!Number.isFinite(travelSec) || !Number.isFinite(noTrafficSec) || noTrafficSec <= 0) {
-    throw new Error("Routing response missing travelTimeInSeconds / noTrafficTravelTimeInSeconds");
+    throw new Error(
+      "Routing response missing travelTimeInSeconds / noTrafficTravelTimeInSeconds"
+    );
   }
 
   const delaySec = Math.max(0, travelSec - noTrafficSec);
@@ -142,6 +156,13 @@ async function tomtomRoute(fromPos, toPos) {
 }
 
 export default async function handler(req, res) {
+  setCors(req, res);
+
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   try {
     if (!TOMTOM_KEY) return serverError(res, "Missing TOMTOM_API_KEY (or TOMTOM_KEY)");
     if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
@@ -168,11 +189,7 @@ export default async function handler(req, res) {
     const fromQ = normalizeQueryToChicago(fromRaw);
     const toQ = normalizeQueryToChicago(toRaw);
 
-    const [fromPos, toPos] = await Promise.all([
-      searchOne(fromQ),
-      searchOne(toQ)
-    ]);
-
+    const [fromPos, toPos] = await Promise.all([searchOne(fromQ), searchOne(toQ)]);
     const route = await tomtomRoute(fromPos, toPos);
 
     const out = {
@@ -185,7 +202,6 @@ export default async function handler(req, res) {
     kv.set(key, out).catch(() => {});
     res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=600");
     return res.status(200).json(out);
-
   } catch (err) {
     console.error("commute api error:", err);
     return serverError(res, err?.message || "Unknown error");
