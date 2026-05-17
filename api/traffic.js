@@ -15,6 +15,7 @@ const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_KEY;
 const CACHE_KEY = "dash_traffic_snapshot_v1";
 const SNAP_TTL_SEC = 300;
 const UPSTREAM_TIMEOUT_MS = 4500;
+const TRAVEL_MIDWEST_QUICK_TRAFFIC_URL = "https://travelmidwest.com/lmiga/chicagoQuickTraffic.json";
 
 async function withTimeout(promise, ms, label) {
   const controller = new AbortController();
@@ -42,6 +43,62 @@ function statusFromRatio(ratio) {
   if (ratio < 1.50) return "Medium";
   if (ratio < 2.00) return "Heavy";
   return "Severe";
+}
+
+function isActiveReversibleRow(row) {
+  return Number(row?.travelTime) > 0 || Number(row?.speed) > 0;
+}
+
+function normalizeReversibleStatus(row, direction) {
+  if (!row) return null;
+  return {
+    direction,
+    description: row.description || null,
+    travel_time_min: Number(row.travelTime) > 0 ? Number(row.travelTime) : null,
+    speed_mph: Number(row.speed) > 0 ? Number(row.speed) : null,
+    active: isActiveReversibleRow(row)
+  };
+}
+
+async function getKennedyReversibleLanes() {
+  const resp = await withTimeout(
+    (signal) => fetch(TRAVEL_MIDWEST_QUICK_TRAFFIC_URL, { signal }),
+    UPSTREAM_TIMEOUT_MS,
+    "Travel Midwest"
+  );
+  const data = await resp.json().catch(() => null);
+
+  if (!resp.ok || !Array.isArray(data)) {
+    throw new Error(`Travel Midwest HTTP ${resp.status}`);
+  }
+
+  const meta = data[0] || {};
+  const reports = Array.isArray(data[1]) ? data[1] : [];
+  const kennedy = reports.find((report) =>
+    String(report?.caption || "").toLowerCase().includes("kennedy")
+  );
+  const rows = Array.isArray(kennedy?.rows) ? kennedy.rows : [];
+
+  const inboundRow = rows.find((row) =>
+    String(row?.description || "").toLowerCase().includes("inbound kennedy reversibles")
+  );
+  const outboundRow = rows.find((row) =>
+    String(row?.description || "").toLowerCase().includes("outbound kennedy reversibles")
+  );
+
+  const inbound = normalizeReversibleStatus(inboundRow, "Inbound");
+  const outbound = normalizeReversibleStatus(outboundRow, "Outbound");
+  const active = [inbound, outbound].find((row) => row?.active);
+
+  return {
+    label: active?.direction || "Closed",
+    direction: active?.direction?.toLowerCase() || "closed",
+    source: "Travel Midwest",
+    source_updated: meta.oldest || null,
+    age_min: Number.isFinite(Number(meta.ageInMinutes)) ? Number(meta.ageInMinutes) : null,
+    inbound,
+    outbound
+  };
 }
 
 function getRoutes() {
@@ -135,6 +192,18 @@ export default async function handler(req, res) {
     }
 
     const routes = getRoutes();
+    let reversibleLanes = null;
+    try {
+      reversibleLanes = await getKennedyReversibleLanes();
+    } catch (err) {
+      console.error("Kennedy reversible lanes failed:", err);
+      reversibleLanes = cached?.routes?.find((rt) => rt.id === "I90_94")?.reversible_lanes || {
+        label: "Unknown",
+        direction: "unknown",
+        source: "Travel Midwest",
+        error: err?.message || "Unknown error"
+      };
+    }
 
     const results = await Promise.all(
       routes.slice(0, 3).map(async (rt) => {
@@ -143,7 +212,8 @@ export default async function handler(req, res) {
           id: rt.id,
           label: rt.label,
           status: statusFromRatio(m.ratio),
-          delay_min: m.delay_min
+          delay_min: m.delay_min,
+          ...(rt.id === "I90_94" && reversibleLanes ? { reversible_lanes: reversibleLanes } : {})
         };
       })
     );
