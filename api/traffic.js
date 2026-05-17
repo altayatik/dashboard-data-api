@@ -60,6 +60,15 @@ function normalizeReversibleStatus(row, direction) {
   };
 }
 
+function applyReversibleLanes(routes, reversibleLanes) {
+  if (!Array.isArray(routes) || !reversibleLanes) return routes;
+  return routes.map((route) =>
+    route.id === "I90_94"
+      ? { ...route, reversible_lanes: reversibleLanes }
+      : route
+  );
+}
+
 async function getKennedyReversibleLanes() {
   const resp = await withTimeout(
     (signal) => fetch(TRAVEL_MIDWEST_QUICK_TRAFFIC_URL, { signal }),
@@ -188,7 +197,22 @@ export default async function handler(req, res) {
     const cacheFresh = cachedAt && ((Date.now() - cachedAt) / 1000) < SNAP_TTL_SEC;
 
     if (cached && cacheFresh) {
-      return sendEmbedded(res, cached);
+      if (cached.routes?.find((rt) => rt.id === "I90_94")?.reversible_lanes) {
+        return sendEmbedded(res, cached);
+      }
+
+      try {
+        const reversibleLanes = await getKennedyReversibleLanes();
+        const enriched = {
+          ...cached,
+          routes: applyReversibleLanes(cached.routes, reversibleLanes)
+        };
+        kv.set(CACHE_KEY, enriched).catch(() => {});
+        return sendEmbedded(res, enriched);
+      } catch (err) {
+        console.error("Kennedy reversible lanes backfill failed:", err);
+        return sendEmbedded(res, cached);
+      }
     }
 
     const routes = getRoutes();
@@ -212,13 +236,13 @@ export default async function handler(req, res) {
           id: rt.id,
           label: rt.label,
           status: statusFromRatio(m.ratio),
-          delay_min: m.delay_min,
-          ...(rt.id === "I90_94" && reversibleLanes ? { reversible_lanes: reversibleLanes } : {})
+          delay_min: m.delay_min
         };
       })
     );
+    const enrichedResults = applyReversibleLanes(results, reversibleLanes);
 
-    const out = { updated_iso: new Date().toISOString(), routes: results };
+    const out = { updated_iso: new Date().toISOString(), routes: enrichedResults };
     kv.set(CACHE_KEY, out).catch(() => {});
     return sendEmbedded(res, out);
 
