@@ -11,13 +11,25 @@ const kv = createClient({
 
 const CACHE_KEY = "last_valid_markets_data";
 const TZ = "America/Chicago";
+const UPSTREAM_TIMEOUT_MS = 4500;
 
 // History cache freshness (controls upstream API usage)
 const HISTORY_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const HISTORY_KEY = (sym) => `hist_5d_${sym}`;
 
 async function j(url) {
-  const r = await fetch(url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  let r;
+  try {
+    r = await fetch(url, { signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") throw new Error(`Timed out fetching ${new URL(url).hostname}`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
   const t = await r.text();
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
   try { return JSON.parse(t); }
@@ -75,7 +87,12 @@ function lastNTradingDays(valuesNewestFirst, n = 5) {
 
 async function getOrRefreshHistory(sym, nowIso) {
   const key = HISTORY_KEY(sym);
-  const cached = await kv.get(key);
+  let cached = null;
+  try {
+    cached = await kv.get(key);
+  } catch (err) {
+    console.error(`KV history read failed for ${sym}:`, err);
+  }
 
   const cachedAt = cached?.cached_at ? Date.parse(cached.cached_at) : 0;
   const ageOk = cachedAt && (Date.now() - cachedAt) < HISTORY_TTL_MS;
@@ -88,9 +105,34 @@ async function getOrRefreshHistory(sym, nowIso) {
   const raw = await timeSeriesDaily(sym, 12);
   const series = lastNTradingDays(raw, 5);
 
-  await kv.set(key, { cached_at: nowIso, series });
+  kv.set(key, { cached_at: nowIso, series }).catch(err =>
+    console.error(`KV history save failed for ${sym}:`, err)
+  );
 
   return series;
+}
+
+function emptySymbol(priceObj = null) {
+  return priceObj || { price: null, change: null, percent_change: null };
+}
+
+async function getCachedSnapshot() {
+  try {
+    return await kv.get(CACHE_KEY);
+  } catch (err) {
+    console.error("KV market snapshot read failed:", err);
+    return null;
+  }
+}
+
+async function settleObject(keys, fn, fallbackForKey) {
+  const settled = await Promise.allSettled(keys.map((key) => fn(key)));
+  return Object.fromEntries(keys.map((key, i) => {
+    const result = settled[i];
+    if (result.status === "fulfilled") return [key, result.value];
+    console.error(`Markets ${key} failed:`, result.reason);
+    return [key, fallbackForKey(key, result.reason)];
+  }));
 }
 
 const formatLocal = (d) =>
@@ -136,6 +178,7 @@ export default async function handler(req, res) {
     const isMarketHours = marketHoursNow(now);
 
     const syms = ["SPY", "QQQ", "IAU", "SLV"];
+    const cached = await getCachedSnapshot();
 
     let marketsObj;
 
@@ -143,12 +186,18 @@ export default async function handler(req, res) {
       // Fetch fresh quotes during market hours
       console.log(`Market open (${formatClock(now)}) → fetching ${syms.join("/")}`);
 
-      const quotes = await Promise.all(syms.map(s => quote(s)));
-      const symbols = Object.fromEntries(syms.map((s, i) => [s, quotes[i]]));
+      const symbols = await settleObject(
+        syms,
+        quote,
+        (sym) => emptySymbol(cached?.symbols?.[sym])
+      );
 
       // History is KV-cached and cheap to request (refresh <= every 6h per symbol)
-      const histories = await Promise.all(syms.map(s => getOrRefreshHistory(s, nowIso)));
-      const history = Object.fromEntries(syms.map((s, i) => [s, histories[i]]));
+      const history = await settleObject(
+        syms,
+        (sym) => getOrRefreshHistory(sym, nowIso),
+        (sym) => cached?.history?.[sym] || []
+      );
 
       marketsObj = {
         updated_iso: nowIso,
@@ -167,14 +216,15 @@ export default async function handler(req, res) {
       // Outside hours → serve last cached snapshot
       console.log("Outside market hours → serving cached data");
 
-      const cached = await kv.get(CACHE_KEY);
-
       if (cached) {
         // Ensure history exists (backfill if older cache didn't have it)
         let history = cached.history;
         if (!history || !history.SPY || !history.IAU) {
-          const histories = await Promise.all(syms.map(s => getOrRefreshHistory(s, nowIso)));
-          history = Object.fromEntries(syms.map((s, i) => [s, histories[i]]));
+          history = await settleObject(
+            syms,
+            (sym) => getOrRefreshHistory(sym, nowIso),
+            (sym) => cached?.history?.[sym] || []
+          );
         }
 
         marketsObj = {
@@ -186,8 +236,11 @@ export default async function handler(req, res) {
         };
       } else {
         // No cache yet
-        const histories = await Promise.all(syms.map(s => getOrRefreshHistory(s, nowIso)));
-        const history = Object.fromEntries(syms.map((s, i) => [s, histories[i]]));
+        const history = await settleObject(
+          syms,
+          (sym) => getOrRefreshHistory(sym, nowIso),
+          () => []
+        );
 
         marketsObj = {
           updated_iso: null,
@@ -210,6 +263,31 @@ export default async function handler(req, res) {
     res.send(js);
   } catch (err) {
     console.error("Markets handler error:", err);
-    res.status(500).send(`// Error: ${err.message || "Unknown error"}`);
+    const fallback = {
+      updated_iso: null,
+      current_fetch_iso: new Date().toISOString(),
+      in_hours: false,
+      stale: true,
+      error: err.message || "Unknown error",
+      symbols: {
+        SPY: emptySymbol(),
+        QQQ: emptySymbol(),
+        IAU: emptySymbol(),
+        SLV: emptySymbol()
+      },
+      history: {
+        SPY: [],
+        QQQ: [],
+        IAU: [],
+        SLV: []
+      }
+    };
+    const js =
+      `// AUTO-GENERATED. DO NOT EDIT.\n` +
+      `window.DASH_DATA = window.DASH_DATA || {}; window.DASH_DATA.markets = ${JSON.stringify(fallback)};\n`;
+
+    res.setHeader("Content-Type", "application/javascript");
+    res.setHeader("Cache-Control", "s-maxage=60, stale-while-revalidate=300");
+    res.send(js);
   }
 }

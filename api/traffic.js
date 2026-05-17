@@ -14,6 +14,20 @@ const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_KEY;
 
 const CACHE_KEY = "dash_traffic_snapshot_v1";
 const SNAP_TTL_SEC = 300;
+const UPSTREAM_TIMEOUT_MS = 4500;
+
+async function withTimeout(promise, ms, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await promise(controller.signal);
+  } catch (err) {
+    if (err?.name === "AbortError") throw new Error(`${label} timed out`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -61,7 +75,11 @@ async function tomtomRoute(origin, destination) {
 
   const url = `https://api.tomtom.com/routing/1/calculateRoute/${encodeURIComponent(loc)}/json?${qs.toString()}`;
 
-  const resp = await fetch(url);
+  const resp = await withTimeout(
+    (signal) => fetch(url, { signal }),
+    UPSTREAM_TIMEOUT_MS,
+    "TomTom"
+  );
   const data = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
@@ -103,7 +121,12 @@ export default async function handler(req, res) {
       return res.status(500).send("// Error: Missing KV_REST_API_URL / KV_REST_API_TOKEN env vars");
     }
 
-    const cached = await kv.get(CACHE_KEY);
+    let cached = null;
+    try {
+      cached = await kv.get(CACHE_KEY);
+    } catch (err) {
+      console.error("traffic cache read failed:", err);
+    }
     const cachedAt = cached?.updated_iso ? Date.parse(cached.updated_iso) : 0;
     const cacheFresh = cachedAt && ((Date.now() - cachedAt) / 1000) < SNAP_TTL_SEC;
 
@@ -131,6 +154,22 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error("traffic api error:", err);
-    res.status(500).send(`// Error: ${err?.message || "Unknown error"}`);
+    try {
+      const stale = await kv.get(CACHE_KEY);
+      if (stale) {
+        return sendEmbedded(res, {
+          ...stale,
+          stale: true,
+          error: err?.message || "Unknown error"
+        });
+      }
+    } catch {}
+
+    return sendEmbedded(res, {
+      updated_iso: new Date().toISOString(),
+      stale: true,
+      error: err?.message || "Unknown error",
+      routes: []
+    });
   }
 }
