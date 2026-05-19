@@ -171,6 +171,17 @@ function marketHoursNow(now) {
   return isWeekday && hour >= 9 && hour < 17;
 }
 
+function sendMarkets(res, marketsObj, cacheControl = "s-maxage=900, stale-while-revalidate=3600") {
+  const banner = `// AUTO-GENERATED. DO NOT EDIT.\n`;
+  const js =
+    banner +
+    `window.DASH_DATA = window.DASH_DATA || {}; window.DASH_DATA.markets = ${JSON.stringify(marketsObj)};\n`;
+
+  res.setHeader("Content-Type", "application/javascript");
+  res.setHeader("Cache-Control", cacheControl);
+  res.send(js);
+}
+
 export default async function handler(req, res) {
   try {
     const now = new Date();
@@ -181,6 +192,16 @@ export default async function handler(req, res) {
     const cached = await getCachedSnapshot();
 
     let marketsObj;
+
+    if (cached && req.query?.fresh !== "1") {
+      return sendMarkets(res, {
+        ...cached,
+        in_hours: isMarketHours,
+        current_fetch_iso: nowIso,
+        current_fetch_local: formatLocal(now),
+        stale: true
+      });
+    }
 
     if (isMarketHours) {
       // Fetch fresh quotes during market hours
@@ -252,15 +273,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const banner = `// AUTO-GENERATED. DO NOT EDIT.\n`;
-    const js =
-      banner +
-      `window.DASH_DATA = window.DASH_DATA || {}; window.DASH_DATA.markets = ${JSON.stringify(marketsObj)};\n`;
-
-    res.setHeader("Content-Type", "application/javascript");
-    // Edge cache helps; KV prevents upstream API spam
-    res.setHeader("Cache-Control", "s-maxage=900, stale-while-revalidate=3600");
-    res.send(js);
+    return sendMarkets(res, marketsObj);
   } catch (err) {
     console.error("Markets handler error:", err);
     const fallback = {
@@ -282,12 +295,6 @@ export default async function handler(req, res) {
         SLV: []
       }
     };
-    const js =
-      `// AUTO-GENERATED. DO NOT EDIT.\n` +
-      `window.DASH_DATA = window.DASH_DATA || {}; window.DASH_DATA.markets = ${JSON.stringify(fallback)};\n`;
-
-    res.setHeader("Content-Type", "application/javascript");
-    res.setHeader("Cache-Control", "s-maxage=60, stale-while-revalidate=300");
-    res.send(js);
+    return sendMarkets(res, fallback, "s-maxage=60, stale-while-revalidate=300");
   }
 }

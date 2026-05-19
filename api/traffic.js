@@ -196,6 +196,14 @@ export default async function handler(req, res) {
     const cachedAt = cached?.updated_iso ? Date.parse(cached.updated_iso) : 0;
     const cacheFresh = cachedAt && ((Date.now() - cachedAt) / 1000) < SNAP_TTL_SEC;
 
+    if (cached?.routes?.find((rt) => rt.id === "I90_94")?.reversible_lanes && req.query?.fresh !== "1") {
+      return sendEmbedded(res, {
+        ...cached,
+        current_fetch_iso: new Date().toISOString(),
+        stale: !cacheFresh
+      });
+    }
+
     if (cached && cacheFresh) {
       if (cached.routes?.find((rt) => rt.id === "I90_94")?.reversible_lanes) {
         return sendEmbedded(res, cached);
