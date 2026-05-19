@@ -296,6 +296,11 @@ export default async function handler(req, res) {
           history
         };
         marketsObj = backfillSymbolsFromHistory(marketsObj, syms);
+        if (hasSymbolPrices(marketsObj)) {
+          kv.set(CACHE_KEY, marketsObj).catch(err =>
+            console.error("KV backfilled market cache save failed:", err)
+          );
+        }
       } else {
         // No cache yet
         const history = await settleObject(
@@ -312,6 +317,11 @@ export default async function handler(req, res) {
           history
         };
         marketsObj = backfillSymbolsFromHistory(marketsObj, syms);
+        if (hasSymbolPrices(marketsObj)) {
+          kv.set(CACHE_KEY, marketsObj).catch(err =>
+            console.error("KV initial market cache save failed:", err)
+          );
+        }
       }
     }
 
