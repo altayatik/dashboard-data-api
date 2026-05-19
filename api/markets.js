@@ -116,6 +116,46 @@ function emptySymbol(priceObj = null) {
   return priceObj || { price: null, change: null, percent_change: null };
 }
 
+function symbolFromHistory(series) {
+  if (!Array.isArray(series) || !series.length) return emptySymbol();
+  const last = series[series.length - 1];
+  const prev = series.length >= 2 ? series[series.length - 2] : null;
+  const price = num(last?.close);
+  const prevClose = num(prev?.close);
+  const change = price != null && prevClose != null ? price - prevClose : null;
+  return {
+    price,
+    change,
+    percent_change: price != null && prevClose ? (change / prevClose) * 100 : null
+  };
+}
+
+function hasSymbolPrices(marketsObj) {
+  return Boolean(marketsObj?.symbols?.SPY?.price != null || marketsObj?.symbols?.IAU?.price != null);
+}
+
+function backfillSymbolsFromHistory(marketsObj, syms) {
+  if (!marketsObj?.history) return marketsObj;
+
+  const symbols = { ...(marketsObj.symbols || {}) };
+  for (const sym of syms) {
+    if (symbols[sym]?.price == null) {
+      symbols[sym] = symbolFromHistory(marketsObj.history[sym]);
+    }
+  }
+
+  const latestDates = syms
+    .map((sym) => marketsObj.history?.[sym]?.at?.(-1)?.date)
+    .filter(Boolean)
+    .sort();
+
+  return {
+    ...marketsObj,
+    updated_iso: marketsObj.updated_iso || (latestDates.length ? `${latestDates[latestDates.length - 1]}T21:00:00.000Z` : null),
+    symbols
+  };
+}
+
 async function getCachedSnapshot() {
   try {
     return await kv.get(CACHE_KEY);
@@ -193,7 +233,7 @@ export default async function handler(req, res) {
 
     let marketsObj;
 
-    if (cached && req.query?.fresh !== "1") {
+    if (cached && hasSymbolPrices(cached) && req.query?.fresh !== "1") {
       return sendMarkets(res, {
         ...cached,
         in_hours: isMarketHours,
@@ -255,6 +295,7 @@ export default async function handler(req, res) {
           current_fetch_local: formatLocal(now),
           history
         };
+        marketsObj = backfillSymbolsFromHistory(marketsObj, syms);
       } else {
         // No cache yet
         const history = await settleObject(
@@ -270,6 +311,7 @@ export default async function handler(req, res) {
           symbols: { SPY: null, QQQ: null, IAU: null, SLV: null },
           history
         };
+        marketsObj = backfillSymbolsFromHistory(marketsObj, syms);
       }
     }
 
