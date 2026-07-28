@@ -1,0 +1,16 @@
+{
+  "name": "altay-dashboard-data-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "check": "node --check api/dashboard.js && node --check api/commute.js && node --check services/weather.js && node --check services/markets.js && node --check services/traffic.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.38.0"
+  }
+}

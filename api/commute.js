@@ -4,36 +4,16 @@
 // Caches per (from,to) pair in Vercel KV.
 // Includes CORS headers so local dev (127.0.0.1) can fetch.
 
-import { createClient } from "@vercel/kv";
 import crypto from "crypto";
-
-const kv = createClient({
-  url: process.env.KV_REST_API_URL,
-  token: process.env.KV_REST_API_TOKEN
-});
+import { cacheGet, cacheSet, ageInSeconds } from "../lib/cache.js";
+import { fetchJson } from "../lib/request.js";
+import { handleOptions, sendError, setCors } from "../lib/http.js";
 
 const TOMTOM_KEY = process.env.TOMTOM_API_KEY || process.env.TOMTOM_KEY;
 const TTL_SEC = 300; // 5 minutes
 
 // Bias center (downtown Chicago)
 const CHI_BIAS = { lat: 41.881832, lon: -87.623177 };
-
-function setCors(req, res) {
-  // For personal dashboards, "*" is fine. If you want to lock down later,
-  // set a specific origin instead.
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
-  res.setHeader("Vary", "Origin");
-}
-
-function badRequest(res, msg) {
-  res.status(400).json({ error: msg });
-}
-
-function serverError(res, msg) {
-  res.status(500).json({ error: msg });
-}
 
 function clampLen(s, max) {
   const v = String(s ?? "").trim();
@@ -80,14 +60,7 @@ async function searchOne(query) {
     query
   )}.json?${qs.toString()}`;
 
-  const resp = await fetch(url);
-  const data = await resp.json().catch(() => ({}));
-
-  if (!resp.ok) {
-    throw new Error(
-      `TomTom search HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`
-    );
-  }
+  const data = await fetchJson(url, {}, 4500);
 
   const results = Array.isArray(data?.results) ? data.results : [];
   if (!results.length) throw new Error(`Search failed for "${query}"`);
@@ -124,14 +97,7 @@ async function tomtomRoute(fromPos, toPos) {
     loc
   )}/json?${qs.toString()}`;
 
-  const resp = await fetch(url);
-  const data = await resp.json().catch(() => ({}));
-
-  if (!resp.ok) {
-    throw new Error(
-      `TomTom routing HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 250)}`
-    );
-  }
+  const data = await fetchJson(url, {}, 4500);
 
   const s = data?.routes?.[0]?.summary;
 
@@ -156,30 +122,21 @@ async function tomtomRoute(fromPos, toPos) {
 }
 
 export default async function handler(req, res) {
-  setCors(req, res);
-
-  // Handle preflight
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
+  if (handleOptions(req, res)) return;
+  if (req.method !== "GET") return sendError(req, res, 405, "Method not allowed");
 
   try {
-    if (!TOMTOM_KEY) return serverError(res, "Missing TOMTOM_API_KEY (or TOMTOM_KEY)");
-    if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
-      return serverError(res, "Missing KV_REST_API_URL / KV_REST_API_TOKEN");
-    }
+    if (!TOMTOM_KEY) return sendError(req, res, 503, "Traffic data is not configured");
 
     const fromRaw = clampLen(req.query.from, 160);
     const toRaw = clampLen(req.query.to, 160);
     if (!fromRaw || !toRaw) {
-      return badRequest(res, 'Provide query params: ?from="..."&to="..."');
+      return sendError(req, res, 400, "Provide both from and to query parameters");
     }
 
     const key = cacheKey(fromRaw, toRaw);
-    const cached = await kv.get(key);
-
-    const cachedAt = cached?.updated_iso ? Date.parse(cached.updated_iso) : 0;
-    const fresh = cachedAt && ((Date.now() - cachedAt) / 1000) < TTL_SEC;
+    const cached = await cacheGet(key);
+    const fresh = cached && ageInSeconds(cached) < TTL_SEC;
 
     if (cached && fresh) {
       res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=600");
@@ -199,11 +156,12 @@ export default async function handler(req, res) {
       route
     };
 
-    kv.set(key, out).catch(() => {});
+    await cacheSet(key, out, 24 * 60 * 60);
+    setCors(req, res);
     res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=600");
     return res.status(200).json(out);
   } catch (err) {
     console.error("commute api error:", err);
-    return serverError(res, err?.message || "Unknown error");
+    return sendError(req, res, 502, err?.message || "Commute unavailable");
   }
 }
