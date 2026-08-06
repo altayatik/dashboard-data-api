@@ -9,8 +9,5 @@
   "scripts": {
     "dev": "vercel dev",
     "check": "node --check api/dashboard.js && node --check api/commute.js && node --check services/weather.js && node --check services/markets.js && node --check services/traffic.js"
-  },
-  "dependencies": {
-    "@upstash/redis": "^1.38.0"
   }
 }

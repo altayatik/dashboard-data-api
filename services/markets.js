@@ -50,6 +50,50 @@ async function fetchSeries(symbol, apiKey) {
   };
 }
 
+async function fetchPublicSeries(symbol) {
+  const start = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000);
+  const params = new URLSearchParams({
+    assetclass: "etf",
+    fromdate: start.toISOString().slice(0, 10),
+    limit: "10"
+  });
+  const data = await fetchJson(`https://api.nasdaq.com/api/quote/${symbol}/historical?${params}`, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; AltayDashboard/2.0)"
+    }
+  }, 6000);
+  const rows = data?.data?.tradesTable?.rows;
+  const history = (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      date: row.date,
+      close: valueAsNumber(String(row.close || "").replace(/[$,]/g, ""))
+    }))
+    .filter((point) => point.close != null)
+    .slice(0, 8)
+    .reverse();
+  if (history.length < 2) throw new Error(`No public market history for ${symbol}`);
+  const price = history.at(-1).close;
+  const previous = history.at(-2).close;
+  return {
+    price,
+    change: price - previous,
+    percent_change: previous ? ((price - previous) / previous) * 100 : 0,
+    history
+  };
+}
+
+async function resilientSeries(symbol, apiKey) {
+  if (apiKey) {
+    try {
+      return await fetchSeries(symbol, apiKey);
+    } catch {
+      // The public daily feed keeps the dashboard useful through provider quotas.
+    }
+  }
+  return fetchPublicSeries(symbol);
+}
+
 export async function getMarkets(query = {}) {
   const [currentCache, legacyCache] = await Promise.all([
     cacheGet(CACHE_KEY),
@@ -63,13 +107,9 @@ export async function getMarkets(query = {}) {
   }
 
   const apiKey = process.env.TWELVEDATA_API_KEY;
-  if (!apiKey) {
-    if (cached) return { ...cached, in_hours: inHours, stale: true, error: "Market API key unavailable" };
-    throw new Error("Market data is not configured");
-  }
 
   try {
-    const results = await Promise.allSettled(SYMBOLS.map((symbol) => fetchSeries(symbol, apiKey)));
+    const results = await Promise.allSettled(SYMBOLS.map((symbol) => resilientSeries(symbol, apiKey)));
     const symbols = {};
     for (let index = 0; index < SYMBOLS.length; index += 1) {
       const symbol = SYMBOLS[index];
@@ -80,7 +120,7 @@ export async function getMarkets(query = {}) {
     if (!symbols.SPY) throw new Error("Primary market signal unavailable");
     const payload = {
       updated_iso: new Date().toISOString(),
-      source: "Twelve Data",
+      source: apiKey ? "Twelve Data + Nasdaq fallback" : "Nasdaq",
       in_hours: inHours,
       partial: Object.keys(symbols).length !== SYMBOLS.length,
       symbols
